@@ -1,0 +1,78 @@
+# Inference & Visualization Scripts
+
+This directory contains several standalone entry points that illustrate different
+ways to run Qwen3-VL locally. All scripts assume you have already installed the
+environment described in the project README and that checkpoints live under
+`./checkpoints/`.
+
+## `run_infer.py`
+
+Minimal VQA runner. Loads a checkpoint, feeds one image + question, and prints
+the answer. Only depends on `transformers` and the base requirements.
+
+```
+python scripts/run_infer.py \
+  --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct \
+  --image ./cookbooks/assets/demo.jpeg \
+  --question "Describe the scene."
+```
+
+## `run_infer2.py` – L2 Feature Maps
+
+Extends the basic runner by capturing each vision block's output and computing
+the L2 norm of visual tokens (after spatial merge). It saves per-layer heatmaps
+plus overlays to `visualizations/`. Use `--cpu-only` if your GPU memory is
+tight.
+
+```
+python scripts/run_infer2.py \
+  --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct \
+  --image ./cookbooks/assets/eg.jpg \
+  --question "图片中有几个人？"
+```
+
+## `run_infer3.py` – Similarity-Based Attention Proxy
+
+Captures the same vision block features as `run_infer2`, but computes the
+cosine similarity between a selected image token (specified via
+`--token-row/--token-col`) and all other tokens. This highlights semantic
+correlation rather than the model's true attention. Results are saved under
+`visualizations_attention/`.
+
+```
+python scripts/run_infer3.py \
+  --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct \
+  --image ./cookbooks/assets/eg.jpg \
+  --question "谁在踢足球？" \
+  --token-row 2 --token-col 5
+```
+
+## `run_infer4.py` – True Attention Maps
+
+Switches the model to `eager` attention, monkey-patches the underlying forward
+call, and captures the real softmax attention weights per vision block. The
+selected token is highlighted on the overlay with a red box.
+
+> ⚠️ **Memory usage:** true attention requires storing a full
+> `(num_heads × seq_len × seq_len)` matrix per block. For large images (more
+> patches) this can easily exhaust GPU memory. Use smaller images, capture only
+> a subset of blocks, or fall back to `--cpu-only` if you hit OOM.
+
+```
+python scripts/run_infer4.py \
+  --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct \
+  --image ./cookbooks/assets/eg.jpg \
+  --question "图片里有哪些人？" \
+  --token-row 3 --token-col 4 \
+  --cpu-only
+```
+
+Outputs are written to `visualizations_true_attention/`.
+
+## Tips
+
+1. **Checkpoints:** update `--checkpoint` to point to any local or HF path.
+2. **Image size:** L2/attention visualizations scale with the number of patches.
+   Downscale images or adjust the processor config if you encounter OOM.
+3. **Selective capture:** if you only need specific layers, modify the scripts
+   to register hooks for the desired block indices to reduce memory overhead.

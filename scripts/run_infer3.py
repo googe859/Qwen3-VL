@@ -1,12 +1,11 @@
 #!/usr/bin/env python
 """
-Minimal VQA inference entry point for Qwen3-VL.
+Attention-like visualization for Qwen3-VL vision blocks.
 
-Usage example:
-    python scripts/run_infer.py \
-        --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct \
-        --image ./cookbooks/assets/demo.jpeg \
-        --question "Describe the image."
+This script runs a single-turn VQA inference while capturing the vision
+blocks' outputs. For a user-specified image token (row, col), it computes
+the cosine similarity between that token and all other visual tokens per
+block, providing an attention-style heatmap plus an overlay on the image.
 """
 
 from __future__ import annotations
@@ -14,15 +13,20 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-import torch
-from PIL import Image
-from transformers import AutoModelForImageTextToText, AutoProcessor
 import matplotlib.pyplot as plt
 import numpy as np
-#hook get vision block features
-vision_block_feats = []
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from transformers import AutoModelForImageTextToText, AutoProcessor
+
+# Buffer to collect per-block outputs
+vision_block_feats: list[torch.Tensor] = []
+
+
 def register_vision_hooks(model):
-    """Capture each vision block's output."""
+    """Attach hooks that save each vision block's output."""
+
     handles = []
 
     def capture_output(_, __, output):
@@ -35,24 +39,36 @@ def register_vision_hooks(model):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run VQA inference with Qwen3-VL.")
+    parser = argparse.ArgumentParser(description="Visualize per-block similarities for Qwen3-VL.")
     parser.add_argument(
         "--checkpoint",
         type=str,
         default="./checkpoints/Qwen3-VL-4B-Instruct",
-        help="Model directory or Hugging Face repo id.",
+        help="Model directory or HF repo id.",
     )
     parser.add_argument(
         "--image",
         type=str,
         required=True,
-        help="Path to the image used for VQA.",
+        help="Path to the input image.",
     )
     parser.add_argument(
         "--question",
         type=str,
         required=True,
         help="Question to ask about the image.",
+    )
+    parser.add_argument(
+        "--token-row",
+        type=int,
+        default=0,
+        help="Row index (after spatial merge) for the target visual token.",
+    )
+    parser.add_argument(
+        "--token-col",
+        type=int,
+        default=0,
+        help="Column index (after spatial merge) for the target visual token.",
     )
     parser.add_argument(
         "--max-new-tokens",
@@ -63,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cpu-only",
         action="store_true",
-        help="Force running inference on CPU.",
+        help="Run everything on CPU (slower).",
     )
     return parser.parse_args()
 
@@ -76,10 +92,10 @@ def load_image(path: str) -> Image.Image:
 
 
 def main() -> None:
-    out_dir = Path("visualizations")
+    args = parse_args()
+    out_dir = Path("visualizations_attention")
     out_dir.mkdir(exist_ok=True)
     vision_block_feats.clear()
-    args = parse_args()
 
     device_map = "auto"
     torch_dtype = "auto"
@@ -94,6 +110,7 @@ def main() -> None:
         torch_dtype=torch_dtype,
     )
     processor = AutoProcessor.from_pretrained(args.checkpoint)
+
     hook_handles = register_vision_hooks(model)
 
     image = load_image(args.image)
@@ -115,30 +132,18 @@ def main() -> None:
     )
     inputs = inputs.to(model.device)
 
-    print("Running generation ...")
+    print("Running representation pass ...")
     with torch.inference_mode():
-        outputs = model(
+        _ = model(
             **inputs,
             output_hidden_states=True,
             return_dict=True,
         )
+
     for handle in hook_handles:
         handle.remove()
 
-     
-
-       
-       
-        # layer_idx = 1  # 先挑第1层
-        # hs = outputs.hidden_states[layer_idx][0, :vision_token_len, :]  # (864, 2560)# 形状: [batch, seq_len, hidden_dim]# 前N个位置: [vision_token_len, hidden_dim]
-        # norms = hs.norm(dim=-1)  # (237?,)
-        # grid = norms.view(t, h, w).squeeze(0)  # (24, 36)
-        #print(grid.min().item(), grid.max().item())
-        #print(outputs.keys()) #odict_keys(['logits', 'past_key_values', 'rope_deltas', 'hidden_states'])
-        #print(len(outputs.hidden_states), outputs.hidden_states[0].shape)#37 torch.Size([1, 237, 2560])
-        # print(inputs["image_grid_thw"]) # tensor([[ 1, 24, 36]], device='cuda:0')
-        # print("pixel_values:", inputs["pixel_values"].shape) #pixel_values: torch.Size([864, 1536])
-        # print("image_grid_thw:", inputs["image_grid_thw"]) #image_grid_thw: tensor([[ 1, 24, 36]], device='cuda:0')
+    print("Running generation ...")
     with torch.inference_mode():
         generated_ids = model.generate(
             **inputs,
@@ -153,42 +158,61 @@ def main() -> None:
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )[0]
-    # print("\nQuestion:", args.question)
-    # print("Answer:", answer)
-    # import inspect
-    # print(inspect.signature(model.forward))
-    # Remove hooks
+    print("\nQuestion:", args.question)
+    print("Answer:", answer)
 
-
-    merge = model.model.visual.spatial_merge_size  # 通常=2
+    merge = model.model.visual.spatial_merge_size
     t, h, w = inputs["image_grid_thw"][0].tolist()
     h_m, w_m = h // merge, w // merge
     vision_len = t * h_m * w_m
 
-    for idx, feat in enumerate(vision_block_feats):
-        grid = feat[:vision_len].norm(dim=-1).view(t, h_m, w_m).squeeze(0)
-        grid_np = grid.to(torch.float32).cpu().numpy()
-        grid_norm = (grid_np - grid_np.min()) / (grid_np.max() - grid_np.min() + 1e-6)
+    row = max(0, min(args.token_row, h_m - 1))
+    col = max(0, min(args.token_col, w_m - 1))
+    target_idx = row * w_m + col
 
-        fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+    img_width, img_height = image.size
+    patch_w = img_width / w_m
+    patch_h = img_height / h_m
+    rect_x = col * patch_w
+    rect_y = row * patch_h
 
-        axes[0].imshow(grid_np, cmap="inferno")
-        axes[0].set_title(f"Vision Block {idx} - L2 Heatmap")
+    print(f"Target token -> row {row}, col {col}, index {target_idx}")
+
+    for idx, feat in enumerate(vision_block_feats[: len(model.model.visual.blocks)]):
+        block_feat = feat[:vision_len]  # (vision_len, hidden)
+
+        target_vec = block_feat[target_idx : target_idx + 1]
+        sim = F.cosine_similarity(block_feat, target_vec, dim=-1)
+        sim_grid = sim.view(t, h_m, w_m).squeeze(0)
+
+        sim_np = sim_grid.to(torch.float32).cpu().numpy()
+        sim_norm = (sim_np - sim_np.min()) / (sim_np.max() - sim_np.min() + 1e-6)
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+        axes[0].imshow(sim_np, cmap="inferno")
+        axes[0].set_title(f"Block {idx} similarity")
         axes[0].axis("off")
 
-        heat_resized = Image.fromarray((grid_norm * 255).astype(np.uint8)).resize(image.size, Image.BILINEAR)
+        heat_resized = Image.fromarray((sim_norm * 255).astype(np.uint8)).resize(image.size, Image.BILINEAR)
         axes[1].imshow(image)
         axes[1].imshow(heat_resized, cmap="inferno", alpha=0.4)
-        axes[1].set_title("Overlayed Visualization")
+        axes[1].add_patch(
+            plt.Rectangle(
+                (rect_x, rect_y),
+                patch_w,
+                patch_h,
+                linewidth=1.0,
+                edgecolor="red",
+                facecolor="none",
+            )
+        )
+        axes[1].set_title("Overlay")
         axes[1].axis("off")
 
         plt.tight_layout()
-        plt.savefig(out_dir / f"block_{idx:02d}_l2.png", bbox_inches="tight")
+        plt.savefig(out_dir / f"block_{idx:02d}_token_{row}_{col}.png", bbox_inches="tight")
         plt.close(fig)
-
-
-
-
 
 
 if __name__ == "__main__":
