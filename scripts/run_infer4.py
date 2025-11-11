@@ -48,6 +48,31 @@ def install_attention_hooks(model):
         block.attn._block_idx = idx
 
 
+
+   ####qwen3vl中有四块ptach拼成一个ptach的步骤，主要过程如下(我们需要逆运算回去)
+#      pos_embed = pos_embed.view(
+#       t,
+#       h // merge_size, merge_size,
+#       w // merge_size, merge_size,
+#       -1,
+#   ).permute(0, 1, 3, 2, 4, 5).flatten(0, 4)
+#对于注意力图没有最后一个维度
+def unshuffle_attention(vec, t, grid_h, grid_w, merge):
+    # vec: [seq_len]
+    seq_len = t * grid_h * grid_w
+    vec = vec[:seq_len]
+    vec = vec.unsqueeze(-1)                  # -> [seq_len, 1]
+    vec = vec.view(
+        t,
+        grid_h // merge,grid_w // merge,
+        merge, merge,
+        1,
+    )
+    vec = vec.permute(0, 1, 3, 2, 4, 5).contiguous().squeeze(-1)
+    return vec.view(t, grid_h, grid_w)       # 最后一维被 squeeze 掉
+
+
+
 def restore_attention_hooks(model):
     """Restore original attention implementation."""
 
@@ -126,38 +151,113 @@ def main():
     restore_attention_hooks(model)
 
     merge = model.model.visual.spatial_merge_size
-    t, h, w = inputs["image_grid_thw"][0].tolist()
-    h_m, w_m = h // merge, w // merge
-    vision_len = t * h_m * w_m
+    t, grid_h, grid_w = inputs["image_grid_thw"][0].tolist()
+    h_m, w_m = grid_h // merge, grid_w // merge
+    
+    vision_len =  grid_h * grid_h
 
     row = max(0, min(args.token_row, h_m - 1))
     col = max(0, min(args.token_col, w_m - 1))
-    target_idx = row * w_m + col
-
+    i= row % merge
+    j= col % merge
+    x_blk= row // merge
+    y_blk= col // merge
+    
+   # ============================================================
+# 【Qwen3-VL / InternVL 空间合并 (Spatial Merge) 坐标映射说明】
+# ============================================================
+#
+# 模型视觉塔输出的初始网格尺寸：
+#   (t, grid_h, grid_w, hidden)
+#   - t: 时间维（图像时通常 = 1）
+#   - grid_h, grid_w: 图像被划分为的 patch 网格行列数
+#     例如 24×36，即每张图像被拆成 24×36 个小 patch
+#   - hidden: 每个 patch 的嵌入维度
+#
+# 模型的空间合并参数为：
+#   merge_size = ms  （常见取值 2）
+#   表示每 ms×ms 个 patch 合并为一个“粗粒度 patch”。
+#
+# ------------------------------------------------------------
+# 一、view 重排
+# ------------------------------------------------------------
+#   pos_embed = pos_embed.view(
+#       t,
+#       grid_h // ms, ms,       # → (块行, 块内行)
+#       grid_w // ms, ms,       # → (块列, 块内列)
+#       hidden
+#   )
+#
+#   原始 patch 坐标 (x, y) 映射为：
+#       x_blk = x // ms    # 外层块行坐标
+#       i     = x %  ms    # 块内行偏移
+#       y_blk = y // ms    # 外层块列坐标
+#       j     = y %  ms    # 块内列偏移
+#
+#   重排后坐标为：
+#       (t_idx, x_blk, i, y_blk, j, hidden)
+#
+# ------------------------------------------------------------
+# 二、permute 调换维度
+# ------------------------------------------------------------
+#   pos_embed = pos_embed.permute(0, 1, 3, 2, 4, 5)
+#   维度顺序变为：
+#       (t_idx, x_blk, y_blk, i, j, hidden)
+#
+#   这样同一 block 内的 ms×ms patch 会在内存中连续排列，
+#   便于后续 flatten 或线性聚合。
+#
+# ------------------------------------------------------------
+# 三、flatten 展平后的序列顺序（row-major）
+# ------------------------------------------------------------
+#   展平顺序: (t, x_blk, y_blk, i, j)
+#
+#   因此，原始坐标 (x, y) 对应 flatten 后序列的线性下标：
+#
+#       flat_idx =
+#           ((((t_idx * (grid_h//ms) + x_blk)
+#                 * (grid_w//ms) + y_blk)
+#                 * ms + i)
+#                 * ms + j)
+    target_idx = (((((t-1)* (grid_h//merge) + x_blk)* (grid_w//merge) + y_blk)* merge + i)* merge + j)
     img_width, img_height = image.size
-    patch_w = img_width / w_m
-    patch_h = img_height / h_m
+    patch_w = img_width / grid_w
+    patch_h = img_height / grid_h
     rect_x = col * patch_w
     rect_y = row * patch_h
+
 
     print("Total attention blocks captured:", len(vision_block_attn))
 
     for idx, attn_probs in vision_block_attn:
         attn_flat = attn_probs.squeeze(0).mean(dim=0)  # average heads
-        attn_flat = attn_flat[target_idx]
-        attn_grid = attn_flat[:vision_len].view(t, h_m, w_m).squeeze(0)
 
-        attn_np = attn_grid.to(torch.float32).cpu().numpy()
-        attn_norm = (attn_np - attn_np.min()) / (attn_np.max() - attn_np.min() + 1e-6)
+        attn_flat = attn_flat[target_idx]
+        
+        attn_grid = unshuffle_attention(attn_flat, t, grid_h, grid_w, merge)
+
+        attn_np = attn_grid.to(torch.float32).cpu().numpy().squeeze(0)
+        min_val, max_val = np.percentile(attn_np, [1, 99])
+        attn_clipped = np.clip(attn_np, min_val, max_val)
+        attn_norm = (attn_clipped - min_val) / (max_val - min_val + 1e-6)
+        attn_display = np.power(attn_norm, 0.8)
+
+        cmap = plt.get_cmap("inferno")
+        heat_rgb = (cmap(attn_display)[..., :3] * 255).astype("uint8")
+        heat_img = Image.fromarray(heat_rgb).resize(image.size, Image.BILINEAR)
+        heat_arr = np.array(heat_img).astype(np.float32)
+        overlay_arr = np.clip(
+            0.7 * np.array(image, dtype=np.float32) + 0.3 * heat_arr,
+            0,
+            255,
+        ).astype(np.uint8)
 
         fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-        axes[0].imshow(attn_np, cmap="inferno")
+        axes[0].imshow(attn_display, cmap="inferno")
         axes[0].set_title(f"Block {idx} true attention")
         axes[0].axis("off")
 
-        heat_resized = Image.fromarray((attn_norm * 255).astype(np.uint8)).resize(image.size, Image.BILINEAR)
-        axes[1].imshow(image)
-        axes[1].imshow(heat_resized, cmap="inferno", alpha=0.4)
+        axes[1].imshow(overlay_arr)
         axes[1].add_patch(
             plt.Rectangle((rect_x, rect_y), patch_w, patch_h, linewidth=1.0, edgecolor="red", facecolor="none")
         )

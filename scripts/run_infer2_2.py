@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from pyexpat import model
 
 import torch
 from PIL import Image
@@ -22,7 +21,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-early_feats: list[tuple[str, torch.Tensor]] = []
+merged_feats: list[tuple[str, torch.Tensor]] = []
 
 
 def _normalize_hidden(hidden: torch.Tensor) -> torch.Tensor:
@@ -36,63 +35,28 @@ def _normalize_hidden(hidden: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Unsupported hidden shape: {hidden.shape}")
 
 
-def _unshuffle_vision_tokens(
-    feat: torch.Tensor,
-    t: int,
-    grid_h: int,
-    grid_w: int,
-    merge_size: int,
-) -> torch.Tensor:
-    ####qwen3vl中有四块ptach拼成一个ptach的步骤，主要过程如下(我们需要逆运算回去)
-#      pos_embed = pos_embed.view(
-#       t,
-#       h // merge_size, merge_size,
-#       w // merge_size, merge_size,
-#       -1,
-#   ).permute(0, 1, 3, 2, 4, 5).flatten(0, 4)
-    """Undo the block-major ordering used before the spatial merger."""
-    hidden = feat.shape[-1]
-    total = t * grid_h * grid_w
-    if feat.shape[0] < total:
-        raise ValueError(f"Insufficient tokens: expected {total}, got {feat.shape[0]}")
-    feat = feat[:total]
-    feat = feat.view(
-        t,
-        grid_h // merge_size,
-        grid_w // merge_size,
-        merge_size,
-        merge_size,
-        hidden,
-    )
-    feat = feat.permute(0, 1, 3, 2, 4, 5).contiguous()
-    return feat.view(t, grid_h, grid_w, hidden)
 
-
-def register_early_hooks(model, max_blocks=None):
+def register_merger_hooks(model, max_blocks=None):
     handles = []
 
-    def capture_patch(_, __, output):
-        hidden = output[0] if isinstance(output, tuple) else output
-        hidden = _normalize_hidden(hidden)[0]
-        early_feats.append(("patch_embed", hidden.detach().cpu()))
+    def capture(module_name):
+        def hook(_, __, output):
+            merged_feats.append((module_name, output.detach().cpu()))
 
-    handles.append(model.model.visual.patch_embed.register_forward_hook(capture_patch))
+        return hook
 
-    for idx, block in enumerate(model.model.visual.blocks):
-        if max_blocks is not None and idx >= max_blocks:
-            break
+    handles.append(model.model.visual.merger.register_forward_hook(capture("merger_final")))
 
-        def make_hook(layer_idx):
-            def hook(_, inputs):
-                    hidden_states = inputs[0] if isinstance(inputs, tuple) else inputs
-                    hidden_states = _normalize_hidden(hidden_states)[0]
-                    early_feats.append((f"block_{layer_idx:02d}_in", hidden_states.detach().cpu()))
-            return hook
-
-        handles.append(block.register_forward_pre_hook(make_hook(idx)))
+    deep_list = model.model.visual.deepstack_merger_list
+    indexes = model.model.visual.deepstack_visual_indexes
+    limit = len(indexes) if max_blocks is None else min(len(indexes), max_blocks)
+    for idx in range(limit):
+        block_idx = indexes[idx]
+        handles.append(
+            deep_list[idx].register_forward_hook(capture(f"deepstack_block_{block_idx:02d}"))
+        )
 
     return handles
-
 
 
 
@@ -153,7 +117,7 @@ def load_image(path: str) -> Image.Image:
 def main() -> None:
     out_dir = Path("visualizations")
     out_dir.mkdir(exist_ok=True)
-    early_feats.clear()
+    merged_feats.clear()
     args = parse_args()
 
     device_map = "auto"
@@ -170,7 +134,7 @@ def main() -> None:
     )
     processor = AutoProcessor.from_pretrained(args.checkpoint)
     max_blocks = None if args.max_early_blocks < 0 else args.max_early_blocks
-    handles = register_early_hooks(model, max_blocks)
+    merger_handles = register_merger_hooks(model, max_blocks)
 
     orig_image = load_image(args.image)
     model_image = orig_image
@@ -200,7 +164,7 @@ def main() -> None:
     print("Running representation pass ...")
     with torch.inference_mode():
         model(**inputs, output_hidden_states=True, return_dict=True)
-    for handle in handles:
+    for handle in merger_handles:
         handle.remove()
 
      
@@ -235,16 +199,16 @@ def main() -> None:
 
     t, grid_h, grid_w = inputs["image_grid_thw"][0].tolist()
     merge_size = model.model.visual.spatial_merge_size
-   
-    orig_arr = np.array(orig_image)
+    merged_h = max(1, grid_h // merge_size)
+    merged_w = max(1, grid_w // merge_size)
+    model_arr = np.array(model_image, dtype=np.float32)
 
-    for idx, (label, feat) in enumerate(early_feats):
+    for idx, (label, feat) in enumerate(merged_feats):
         feat = feat.to(torch.float32)
-        aligned = _unshuffle_vision_tokens(feat, t, grid_h, grid_w, merge_size)
-
-        token_norm = aligned.norm(dim=-1)
-        grid = token_norm.mean(0) if t > 1 else token_norm[0]
-
+        vision_len = t * merged_h * merged_w
+        pure_patches = feat[:vision_len]
+        grid = pure_patches.norm(dim=-1).view(t, merged_h, merged_w)
+        grid = grid.mean(0) if t > 1 else grid.squeeze(0)
         grid_np = grid.cpu().numpy()
         min_val, max_val = np.percentile(grid_np, [1, 99])
         grid_clipped = np.clip(grid_np, min_val, max_val)
@@ -254,17 +218,16 @@ def main() -> None:
         cmap = plt.get_cmap("inferno")
         heat_color = (cmap(grid_display)[..., :3] * 255).astype("uint8")
         heat = Image.fromarray(heat_color).resize(model_image.size, Image.BILINEAR)
-        heat_on_orig = heat.resize(orig_image.size, Image.BILINEAR)
-        heat_on_orig_arr = np.array(heat_on_orig).astype(np.float32)
-        overlay_arr = np.clip(0.7 * orig_arr + 0.3 * heat_on_orig_arr, 0, 255).astype(np.uint8)
+        heat_arr = np.array(heat, dtype=np.float32)
+        overlay_arr = np.clip(0.6 * model_arr + 0.4 * heat_arr, 0, 255).astype(np.uint8)
 
         fig, axes = plt.subplots(1, 2, figsize=(8, 4))
 
         axes[0].imshow(grid_display, cmap="inferno")
-        axes[0].set_title(f"{label} L2 Heatmap")
+        axes[0].set_title(f"{label}")
         axes[0].axis("off")
 
-        axes[1].imshow(overlay_arr)
+        axes[1].imshow(overlay_arr.astype(np.uint8))
         axes[1].set_title("Overlayed Visualization")
         axes[1].axis("off")
 
