@@ -111,6 +111,34 @@ python scripts/run_infer2.2.py \
 Outputs include baseline/sparse answers printed to stdout plus the usual merger
 heatmaps saved under `visualizations_merger/`.
 
+## `run_infer2.3.py` – Keep Lowest-Norm Tokens
+
+Variant of `run_infer2.2.py` that retains the smallest L2-norm visual tokens instead of
+the largest ones. Useful for stress-testing how removing the most confident patches
+affects LLM responses.
+
+```
+python scripts/run_infer2.3.py \
+  --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct \
+  --image ./cookbooks/assets/eg6.jpg \
+  --question "请描述这张图片" \
+  --keep-ratio 0.1
+```
+
+## `run_infer2.4.py` – Random Token Keep
+
+Another `run_infer2.2.py` derivative where the sparse pass randomly samples the
+visual tokens to keep (seeded for reproducibility). Lets you compare structured pruning
+versus uniform random dropping.
+
+```
+python scripts/run_infer2.4.py \
+  --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct \
+  --image ./cookbooks/assets/eg6.jpg \
+  --question "请描述这张图片" \
+  --keep-ratio 0.25
+```
+
 ## `keep_ratio_sweep.py` – Batch Compare Sparse Ratios
 
 Convenience wrapper around `run_infer2.2.py`. It iterates over a list of
