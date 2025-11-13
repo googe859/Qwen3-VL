@@ -78,9 +78,6 @@ Outputs are written to `visualizations_true_attention/`.
 
 python scripts/run_infer4.py   --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct   --image ./cookbooks/assets/eg5.png   --question "图片中有几个人，分别在图片的什么位置"   --token-row 3 --token-col 4 
 
-python scripts/run_infer2.2.py   --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct   --image ./cookbooks/assets/eg6.jpg   --question "请描述这张图片"   
-
-
 ## `run_infer2_2.py` – Early Vision-Tower L2
 
 Hooks the vision tower before LayerNorm/merger (patch embedding and early block
@@ -94,6 +91,42 @@ python scripts/run_infer2_2.py \
   --question "What's happening?" \
   --max-blocks 6
 ```
+
+## `run_infer2.2.py` – Token Pruning Baseline vs. Sparse
+
+Runs two passes of the standard VQA pipeline. The first (baseline) keeps the full
+visual sequence, while the second (sparse) reuses the same inputs but, right before
+entering the language model, drops all but the top-K visual tokens by L2 norm
+(controlled by `--keep-ratio`). Useful for studying how aggressive token reduction
+affects generation quality.
+
+```
+python scripts/run_infer2.2.py \
+  --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct \
+  --image ./cookbooks/assets/eg6.jpg \
+  --question "请描述这张图片" \
+  --keep-ratio 0.25
+```
+
+Outputs include baseline/sparse answers printed to stdout plus the usual merger
+heatmaps saved under `visualizations_merger/`.
+
+## `keep_ratio_sweep.py` – Batch Compare Sparse Ratios
+
+Convenience wrapper around `run_infer2.2.py`. It iterates over a list of
+`--keep-ratio` values (defaults to 0.01–0.09 plus 0.1–0.9) and records both the
+baseline and sparse answers for each run into a single text file.
+
+```
+python scripts/keep_ratio_sweep.py \
+  --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct \
+  --image ./cookbooks/assets/eg6.jpg \
+  --question "请描述这张图片" \
+  --output sweep.txt
+```
+
+Pass `--ratios 0.05 0.15 0.5` for a custom schedule, or forward additional
+arguments to `run_infer2.2.py` via `--extra-args -- --fixed-image-size 768`.
 
 ## `stitch_layers.py` – Stack Layer Images
 
