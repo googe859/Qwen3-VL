@@ -111,8 +111,8 @@ def main() -> None:
         skip_special_tokens=True,
         clean_up_tokenization_spaces=False,
     )[0]
-    # print("\nQuestion:", args.question)
-    # print("Answer:", answer)
+    print("\nQuestion:", args.question)
+    print("Answer:", answer)
     import inspect
     print(inspect.signature(model.forward))
 

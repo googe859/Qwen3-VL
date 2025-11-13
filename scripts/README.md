@@ -30,7 +30,7 @@ python scripts/run_infer2.py \
   --image ./cookbooks/assets/eg.jpg \
   --question "图片中有几个人？"
 ```
-
+python scripts/run_infer2.py   --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct   --image ./cookbooks/assets/eg5.png   --question "图片中有几个人，分别在图片的什么位置"   --max-early-blocks 24   --fixed-image-size -1
 ## `run_infer3.py` – Similarity-Based Attention Proxy
 
 Captures the same vision block features as `run_infer2`, but computes the
@@ -67,7 +67,33 @@ python scripts/run_infer4.py \
   --cpu-only
 ```
 
+
+
+python scripts/run_infer4.py \
+  --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct \
+  --image ./cookbooks/assets/eg4.jpg \
+  --question "图片里有哪些人？" \
+  --token-row 3 --token-col 4 \
 Outputs are written to `visualizations_true_attention/`.
+
+python scripts/run_infer4.py   --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct   --image ./cookbooks/assets/eg5.png   --question "图片中有几个人，分别在图片的什么位置"   --token-row 3 --token-col 4 
+
+python scripts/run_infer2.2.py   --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct   --image ./cookbooks/assets/eg6.jpg   --question "请描述这张图片"   
+
+
+## `run_infer2_2.py` – Early Vision-Tower L2
+
+Hooks the vision tower before LayerNorm/merger (patch embedding and early block
+inputs) so the L2 heatmaps preserve clearer object contours. Results go into
+`visualizations_vtower/`.
+
+```
+python scripts/run_infer2_2.py \
+  --checkpoint ./checkpoints/Qwen3-VL-4B-Instruct \
+  --image ./cookbooks/assets/demo.jpeg \
+  --question "What's happening?" \
+  --max-blocks 6
+```
 
 ## `stitch_layers.py` – Stack Layer Images
 
