@@ -23,7 +23,8 @@ from transformers import AutoModelForImageTextToText, AutoProcessor
 
 
 merged_feats: list[tuple[str, torch.Tensor]] = []
-KEEP_RATIO = 0.10
+DEFAULT_KEEP_RATIO = 0.10
+KEEP_RATIO = DEFAULT_KEEP_RATIO
 
 
 def _normalize_hidden(hidden: torch.Tensor) -> torch.Tensor:
@@ -98,19 +99,81 @@ def run_generation(model, processor, inputs, max_new_tokens, tag: str) -> str:
     return answer
 
 
-def prune_visual_tokens(
-    final_feat: torch.Tensor,
-    deepstack_feats: list[torch.Tensor],
+def install_language_pruning_hook(
+    model,
     keep_indices: torch.Tensor,
     vision_len: int,
-) -> tuple[torch.Tensor, list[torch.Tensor]]:
-    keep_idx = keep_indices.to(final_feat.device)
-    pruned_final = final_feat[:vision_len].index_select(0, keep_idx)
-    pruned_deep = [feat[:vision_len].index_select(0, keep_idx) for feat in deepstack_feats]
-    return pruned_final, pruned_deep
+) -> tuple[torch.utils.hooks.RemovableHandle, dict[str, int]]:
+    """Register a hook that trims visual tokens right before entering the language model."""
+    keep_indices = keep_indices.clone()
+    state: dict[str, int] = {"applied": 0, "kept": int(keep_indices.numel()), "total": int(vision_len)}
 
+    def lm_prune_hook(_, args, kwargs):
+        inputs_embeds: torch.Tensor | None = kwargs.get("inputs_embeds")
+        visual_pos_masks: torch.Tensor | None = kwargs.get("visual_pos_masks")
+        deepstack_visual_embeds = kwargs.get("deepstack_visual_embeds")
+        if (
+            inputs_embeds is None
+            or visual_pos_masks is None
+            or deepstack_visual_embeds is None
+            or state["applied"] > 0
+        ):
+            return args, kwargs
 
+        device = inputs_embeds.device
+        keep_idx = keep_indices.to(device)
+        mask = visual_pos_masks.to(device)
+        if mask.shape[0] != 1:
+            raise NotImplementedError("Token pruning currently supports batch size 1 only.")
+        vision_positions = torch.nonzero(mask[0], as_tuple=False).squeeze(-1)
+        if vision_positions.numel() != vision_len:
+            raise RuntimeError(
+                f"Expected {vision_len} visual tokens, but found {vision_positions.numel()} in language inputs."
+            )
 
+        seq_mask = torch.ones(inputs_embeds.shape[1], dtype=torch.bool, device=device)
+        keep_flags = torch.zeros(vision_len, dtype=torch.bool, device=device)
+        keep_flags[keep_idx] = True
+        drop_positions = vision_positions[~keep_flags]
+        seq_mask[drop_positions] = False
+
+        kwargs["inputs_embeds"] = inputs_embeds[:, seq_mask, :].contiguous()
+
+        attention_mask = kwargs.get("attention_mask")
+        if isinstance(attention_mask, torch.Tensor) and attention_mask.ndim == 2:
+            kwargs["attention_mask"] = attention_mask[:, seq_mask]
+        elif isinstance(attention_mask, dict):
+            new_mask = {}
+            for key, value in attention_mask.items():
+                if isinstance(value, torch.Tensor) and value.ndim >= 2 and value.shape[-1] == seq_mask.shape[0]:
+                    new_mask[key] = value[..., seq_mask]
+                else:
+                    new_mask[key] = value
+            kwargs["attention_mask"] = new_mask
+
+        position_ids = kwargs.get("position_ids")
+        if position_ids is not None:
+            kwargs["position_ids"] = position_ids[..., seq_mask]
+
+        cache_position = kwargs.get("cache_position")
+        if cache_position is not None and cache_position.shape[-1] == seq_mask.shape[0]:
+            kwargs["cache_position"] = cache_position[seq_mask]
+
+        kwargs["visual_pos_masks"] = mask[:, seq_mask]
+
+        pruned_deepstack: list[torch.Tensor] = []
+        for embed in deepstack_visual_embeds:
+            pruned_deepstack.append(embed.to(device).index_select(0, keep_idx))
+        kwargs["deepstack_visual_embeds"] = pruned_deepstack
+
+        state["applied"] += 1
+        return args, kwargs
+
+    handle = model.model.language_model.register_forward_pre_hook(
+        lm_prune_hook,
+        with_kwargs=True,
+    )
+    return handle, state
 
 
 def visualize_features(
@@ -230,6 +293,12 @@ def parse_args() -> argparse.Namespace:
         default=1024,
         help="Resize input image to (size, size) before feeding the model (-1 to disable).",
     )
+    parser.add_argument(
+        "--keep-ratio",
+        type=float,
+        default=DEFAULT_KEEP_RATIO,
+        help="Fraction of visual tokens to retain when running the sparse pass (0-1].",
+    )
 
     return parser.parse_args()
 
@@ -245,6 +314,10 @@ def main() -> None:
     out_dir = Path("visualizations_merger")
     out_dir.mkdir(exist_ok=True)
     args = parse_args()
+    if not 0 < args.keep_ratio <= 1:
+        raise ValueError("--keep-ratio must be within (0, 1].")
+    global KEEP_RATIO
+    KEEP_RATIO = args.keep_ratio
 
     device_map = "auto"
     torch_dtype = "auto"
@@ -291,9 +364,6 @@ def main() -> None:
     print("\nQuestion:", args.question)
     print("Baseline Answer:", baseline_answer)
 
-    vision_outputs = model.model.visual(inputs["pixel_values"], grid_thw=inputs["image_grid_thw"])
-    image_feats, deepstack_feats = vision_outputs  # 分别是最终 merge 和 deepstack 列表
-
     t, grid_h, grid_w = inputs["image_grid_thw"][0].tolist()
     merge_size = model.model.visual.spatial_merge_size
     keep_indices, keep_mask_grid = visualize_features(
@@ -310,36 +380,39 @@ def main() -> None:
     merged_h = max(1, grid_h // merge_size)
     merged_w = max(1, grid_w // merge_size)
     vision_len = t * merged_h * merged_w
-    pruned_final, pruned_deep = prune_visual_tokens(
-        image_feats.to(model.device),
-        [feat.to(model.device) for feat in deepstack_feats],
-        keep_indices,
-        vision_len,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    lm_hook, prune_state = install_language_pruning_hook(
+        model=model,
+        keep_indices=keep_indices,
+        vision_len=vision_len,
     )
-    print("Pruned final tokens:", pruned_final.shape)
-    for idx, feat in enumerate(pruned_deep):
-        print(f"Pruned deepstack[{idx}] tokens: {feat.shape}")
+    try:
+        sparse_answer = run_generation(model, processor, inputs, args.max_new_tokens, "Sparse")
+    finally:
+        lm_hook.remove()
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    sparse_feats = run_representation_pass(model, inputs, max_blocks, "sparse")
-    sparse_answer = run_generation(model, processor, inputs, args.max_new_tokens, "Sparse")
     print("Sparse Answer:", sparse_answer)
+    print(
+        f"Sparse pass kept {prune_state['kept']}/{prune_state['total']} visual tokens "
+        f"({prune_state['kept'] / prune_state['total']:.1%})."
+    )
     print("Sparse visualization skipped (reserved for token modification experiments).")
 
     
